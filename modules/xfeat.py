@@ -225,6 +225,87 @@ class XFeat(nn.Module):
 
 
 	@torch.inference_mode()
+	def match_lighterglue_batch(self, d0_list, d1_list, min_conf=0.1):
+		"""
+			Batch version of match_lighterglue. Matches multiple image pairs at once by
+			padding keypoints/descriptors to the same size across the batch.
+			Attention masks are passed to LightGlue so padded positions are ignored.
+
+			Requires the patched lighterglue.py which monkey-patches kornia's
+			positional encoding broadcasting bug and _forward mask support.
+
+			input:
+				d0_list, d1_list: list of Dict('keypoints', 'scores', 'descriptors', 'image_size (Width, Height)')
+			output:
+				List of tuples (mkpts_0, mkpts_1, idxs, mean_score) for each pair
+		"""
+		if not self.kornia_available:
+			raise RuntimeError('We rely on kornia for LightGlue. Install with: pip install kornia')
+		elif self.lighterglue is None:
+			from modules.lighterglue import LighterGlue
+			self.lighterglue = LighterGlue().to(self.dev)
+
+		B = len(d0_list)
+
+		# Find max number of keypoints for padding
+		max_kpts0 = max(d['keypoints'].shape[0] for d in d0_list)
+		max_kpts1 = max(d['keypoints'].shape[0] for d in d1_list)
+
+		# Pad keypoints and descriptors to the same size across the batch
+		kpts0 = torch.zeros(B, max_kpts0, 2, device=self.dev)
+		kpts1 = torch.zeros(B, max_kpts1, 2, device=self.dev)
+		desc0 = torch.zeros(B, max_kpts0, 64, device=self.dev)
+		desc1 = torch.zeros(B, max_kpts1, 64, device=self.dev)
+		img_size0 = torch.zeros(B, 2, device=self.dev, dtype=torch.long)
+		img_size1 = torch.zeros(B, 2, device=self.dev, dtype=torch.long)
+
+		# Create boolean masks: True = real keypoint, False = padding
+		# Shape (B, N, 1) — matches kornia's pad_to_length mask format
+		mask0 = torch.zeros(B, max_kpts0, 1, dtype=torch.bool, device=self.dev)
+		mask1 = torch.zeros(B, max_kpts1, 1, dtype=torch.bool, device=self.dev)
+
+		for b in range(B):
+			n0 = d0_list[b]['keypoints'].shape[0]
+			n1 = d1_list[b]['keypoints'].shape[0]
+			kpts0[b, :n0] = d0_list[b]['keypoints']
+			kpts1[b, :n1] = d1_list[b]['keypoints']
+			desc0[b, :n0] = d0_list[b]['descriptors']
+			desc1[b, :n1] = d1_list[b]['descriptors']
+			img_size0[b] = torch.tensor(d0_list[b]['image_size']).to(self.dev)
+			img_size1[b] = torch.tensor(d1_list[b]['image_size']).to(self.dev)
+			mask0[b, :n0, 0] = True
+			mask1[b, :n1, 0] = True
+
+		data = {
+			'keypoints0': kpts0,
+			'keypoints1': kpts1,
+			'descriptors0': desc0,
+			'descriptors1': desc1,
+			'image_size0': img_size0,
+			'image_size1': img_size1,
+			'mask0': mask0,
+			'mask1': mask1,
+		}
+
+		out = self.lighterglue(data, min_conf=min_conf)
+
+		results = []
+		for b in range(B):
+			idxs = out['matches'][b]
+
+			# idxs are indices into the padded tensors; map back to original
+			pts0 = d0_list[b]['keypoints'][idxs[:, 0]].cpu().numpy()
+			pts1 = d1_list[b]['keypoints'][idxs[:, 1]].cpu().numpy()
+			mean_score = 0.0
+			if len(idxs) > 0 and 'matching_scores0' in out:
+				mean_score = float(out['matching_scores0'][b][idxs[:, 0]].mean().item())
+
+			results.append((pts0, pts1, idxs.cpu().numpy(), mean_score))
+
+		return results
+
+
+	@torch.inference_mode()
 	def match_xfeat(self, img1, img2, top_k = None, min_cossim = -1):
 		"""
 			Simple extractor and MNN matcher.
