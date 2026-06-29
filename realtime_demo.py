@@ -9,11 +9,11 @@ import cv2
 import numpy as np
 import torch
 
-from time import time, sleep
+from time import time
 import argparse, sys, tqdm
-import threading
 
 from modules.xfeat import XFeat
+from camera_pipeline import CameraConfig, CameraPipeline
 
 def argparser():
     parser = argparse.ArgumentParser(description="Configurations for the real-time matching demo.")
@@ -22,31 +22,37 @@ def argparser():
     parser.add_argument('--max_kpts', type=int, default=3_000, help='Maximum number of keypoints.')
     parser.add_argument('--method', type=str, choices=['ORB', 'SIFT', 'XFeat'], default='XFeat', help='Local feature detection method to use.')
     parser.add_argument('--cam', type=int, default=0, help='Webcam device number.')
+    parser.add_argument(
+        '--buffer-size',
+        type=int,
+        default=1,
+        help='OpenCV buffer depth (1 = most responsive / lowest latency on many drivers).',
+    )
+    parser.add_argument(
+        '--disable-auto-exposure',
+        action='store_true',
+        help='Do not set CAP_PROP_AUTO_EXPOSURE (use driver default).',
+    )
+    parser.add_argument(
+        '--auto-exposure',
+        type=float,
+        default=3.0,
+        help='Value for CAP_PROP_AUTO_EXPOSURE when auto exposure is enabled (driver-specific).',
+    )
+    parser.add_argument(
+        '--exposure',
+        type=float,
+        default=None,
+        help='If set, passed to CAP_PROP_EXPOSURE (optional manual exposure; driver-specific).',
+    )
+    parser.add_argument(
+        '--grabber-poll-sleep',
+        type=float,
+        default=0.0,
+        help='Optional sleep in the capture thread after each frame (0 = as fast as the driver returns).',
+    )
     return parser.parse_args()
 
-
-class FrameGrabber(threading.Thread):
-    def __init__(self, cap):
-        super().__init__()
-        self.cap = cap
-        _, self.frame = self.cap.read()
-        self.running = False
-
-    def run(self):
-        self.running = True
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Can't receive frame (stream ended?).")
-            self.frame = frame
-            sleep(0.01)
-
-    def stop(self):
-        self.running = False
-        self.cap.release()
-
-    def get_last_frame(self):
-        return self.frame
 
 class CVWrapper():
     def __init__(self, mtd):
@@ -73,7 +79,6 @@ def init_method(method, max_kpts):
 class MatchingDemo:
     def __init__(self, args):
         self.args = args
-        self.cap = cv2.VideoCapture(args.cam)
         self.width = args.width
         self.height = args.height
         self.ref_frame = None
@@ -81,11 +86,22 @@ class MatchingDemo:
         self.corners = [[50, 50], [640-50, 50], [640-50, 480-50], [50, 480-50]]
         self.current_frame = None
         self.H = None
-        self.setup_camera()
 
-        #Init frame grabber thread
-        self.frame_grabber = FrameGrabber(self.cap)
-        self.frame_grabber.start()
+        self.camera = CameraPipeline(
+            CameraConfig(
+                device_index=args.cam,
+                width=args.width,
+                height=args.height,
+                buffer_size=args.buffer_size,
+                auto_exposure=None if args.disable_auto_exposure else args.auto_exposure,
+                exposure=args.exposure,
+                grabber_poll_sleep=args.grabber_poll_sleep,
+            )
+        )
+        if not self.camera.open():
+            print("Cannot open camera")
+            sys.exit(1)
+        self.camera.start()
 
         #Homography params
         self.min_inliers = 50
@@ -114,17 +130,6 @@ class MatchingDemo:
         cv2.resizeWindow(self.window_name, self.width*2, self.height*2)
         #Set Mouse Callback
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
-
-    def setup_camera(self):
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
-        #self.cap.set(cv2.CAP_PROP_EXPOSURE, 200)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-
-        if not self.cap.isOpened():
-            print("Cannot open camera")
-            exit()
 
     def draw_quad(self, frame, point_list):
         if len(self.corners) > 1:
@@ -257,7 +262,7 @@ class MatchingDemo:
         return matched_frame
 
     def main_loop(self):
-        self.current_frame = self.frame_grabber.get_last_frame()
+        self.current_frame = self.camera.get_frame()
         self.ref_frame = self.current_frame.copy()
         self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None) #Cache ref features
 
@@ -275,7 +280,7 @@ class MatchingDemo:
                 self.ref_frame = self.current_frame.copy()  # Update reference frame
                 self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None) #Cache ref features
 
-            self.current_frame = self.frame_grabber.get_last_frame()
+            self.current_frame = self.camera.get_frame()
 
             #Measure avg. FPS
             self.time_list.append(time()-t0)
@@ -286,8 +291,7 @@ class MatchingDemo:
         self.cleanup()
 
     def cleanup(self):
-        self.frame_grabber.stop()
-        self.cap.release()
+        self.camera.close()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":

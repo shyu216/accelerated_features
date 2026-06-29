@@ -4,6 +4,8 @@
 	https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
 """
 
+from __future__ import annotations
+
 import numpy as np
 import os
 import torch
@@ -14,22 +16,75 @@ import tqdm
 from modules.model import *
 from modules.interpolator import InterpolateSparse2d
 
+
+def resolve_inference_device(name: str | None) -> torch.device:
+	"""
+	Map a CLI-style device string to torch.device.
+	``None`` / ``"auto"`` prefers CUDA, then Apple MPS, then CPU.
+	"""
+	if name is None or name == "auto":
+		if torch.cuda.is_available():
+			return torch.device("cuda", torch.cuda.current_device())
+		if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+			return torch.device("mps")
+		return torch.device("cpu")
+	if name == "cpu":
+		return torch.device("cpu")
+	if name == "cuda":
+		if not torch.cuda.is_available():
+			raise RuntimeError(
+				"device='cuda' but torch.cuda.is_available() is False. "
+				"Install a CUDA build of PyTorch (see https://pytorch.org/get-started/locally/)."
+			)
+		return torch.device("cuda", torch.cuda.current_device())
+	if name == "mps":
+		if getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available():
+			raise RuntimeError("device='mps' but MPS is not available.")
+		return torch.device("mps")
+	raise ValueError(f"Unknown device name: {name!r}")
+
+
+def _coerce_xfeat_device(device: str | torch.device | None) -> torch.device:
+	if isinstance(device, torch.device):
+		if device.type == "cuda" and not torch.cuda.is_available():
+			raise RuntimeError(
+				"XFeat was given torch.device('cuda') but torch.cuda.is_available() is False."
+			)
+		if device.type == "mps" and (
+			getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available()
+		):
+			raise RuntimeError("XFeat was given torch.device('mps') but MPS is not available.")
+		return device
+	if device is None:
+		return resolve_inference_device("auto")
+	if isinstance(device, str):
+		return resolve_inference_device(device)
+	raise TypeError(f"device must be str, torch.device, or None, got {type(device)}")
+
+
 class XFeat(nn.Module):
 	""" 
 		Implements the inference module for XFeat. 
 		It supports inference for both sparse and semi-dense feature extraction & matching.
 	"""
 
-	def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../weights/xfeat.pt', top_k = 4096, detection_threshold=0.05):
+	def __init__(
+		self,
+		weights=os.path.abspath(os.path.dirname(__file__)) + "/../weights/xfeat.pt",
+		top_k=4096,
+		detection_threshold=0.05,
+		device: str | torch.device | None = None,
+	):
 		super().__init__()
-		self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+		self.dev = _coerce_xfeat_device(device)
+		print(f"XFeat inference device: {self.dev}", flush=True)
 		self.net = XFeatModel().to(self.dev).eval()
 		self.top_k = top_k
 		self.detection_threshold = detection_threshold
 
 		if weights is not None:
 			if isinstance(weights, str):
-				print('loading weights from: ' + weights)
+				print("loading weights from: " + weights)
 				self.net.load_state_dict(torch.load(weights, map_location=self.dev))
 			else:
 				self.net.load_state_dict(weights)
@@ -143,7 +198,8 @@ class XFeat(nn.Module):
 			raise RuntimeError('We rely on kornia for LightGlue. Install with: pip install kornia')
 		elif self.lighterglue is None:
 			from modules.lighterglue import LighterGlue
-			self.lighterglue = LighterGlue()
+
+			self.lighterglue = LighterGlue().to(self.dev)
 
 		data = {
 				'keypoints0': d0['keypoints'][None, ...],
@@ -159,7 +215,13 @@ class XFeat(nn.Module):
 
 		idxs = out['matches'][0]
 
-		return d0['keypoints'][idxs[:, 0]].cpu().numpy(), d1['keypoints'][idxs[:, 1]].cpu().numpy(), out['matches'][0].cpu().numpy()
+		pts0 = d0['keypoints'][idxs[:, 0]].cpu().numpy()
+		pts1 = d1['keypoints'][idxs[:, 1]].cpu().numpy()
+		mean_score = 0.0
+		if len(idxs) > 0 and 'matching_scores0' in out:
+			mean_score = float(out['matching_scores0'][0][idxs[:, 0]].mean().item())
+
+		return pts0, pts1, idxs.cpu().numpy(), mean_score
 
 
 	@torch.inference_mode()
